@@ -1,8 +1,21 @@
 import random
 import time
 import math
+import sys
 
-from neopixel import NeoPixel
+# Switch between MicroPython and Python 
+
+MICROPYTHON = sys.platform == "rp2"
+
+if MICROPYTHON:
+    from neopixel import NeoPixel
+    from time import sleep, ticks_ms
+else:
+    from time import monotonic
+    def sleep(seconds):
+        pass
+    def ticks_ms():
+        return int(monotonic() * 1000)
 
 WIDTH = 16  # Width of the LED grid in landscape mode
 HEIGHT = 10  # Height of the LED grid in landscape mode
@@ -30,13 +43,13 @@ DEBUG = False
 # region Helper Functions
 ################################################################################
 
-def pixel2index(u, v, width=WIDTH, height=HEIGHT):
+def pixel2index(u, v, width=WIDTH):
     """Convert (row, col) in portrait to flat index for pixel dict"""
     u_landscape = int(v)
     v_landscape = int(width - 1 - u)
     return u_landscape * width + v_landscape
 
-def index2pixel(i, width=WIDTH, height=HEIGHT):
+def index2pixel(i, width=WIDTH):
     """Convert (row, col) in portrait to flat index for pixel dict"""
     u_landscape = i // width
     v_landscape = i % width
@@ -679,6 +692,7 @@ class AnimationManager:
         self.loop = loop
         self.duration = -1  # Total duration in frames (None = infinite)
         self.frames_between_loops = frames_between_loops
+        self.repeat_count = 0
         
     def add_animation(self, animation, start_frame=0, duration=None):
         """
@@ -709,6 +723,7 @@ class AnimationManager:
         if self.loop and self.duration is not None:
             if self.global_frame >= self.duration + self.frames_between_loops:
                 self.global_frame = 0
+                self.repeat_count += 1
                 for anim_info in self.animations:
                     anim_info['animation'].reset()
         
@@ -755,6 +770,10 @@ class AnimationManager:
     def get_frame(self):
         """Get the current global frame counter"""
         return self.global_frame
+    
+    def get_repeat_count(self):
+        """Get the number of times the animation sequence has repeated"""
+        return self.repeat_count
 
 
 ################################################################################
@@ -1218,9 +1237,9 @@ class FireworkAnimation(Animation):
     
     
 ################################################################################
-# region Main Animation Loop
+# region Rendering
 ################################################################################
-def render(strip, pixels):
+def render_pico(strip, pixels):
     """Render pixel dictionary to LED strip"""
     background = pixels.pop('background', DARK_BLUE)
     strip.pixels_fill(background)
@@ -1233,10 +1252,225 @@ def render(strip, pixels):
     
     strip.pixels_show()
     
+    
+class RendererBase:
+    """Base class for rendering pixel data to different targets"""
+    
+    def __init__(self, width=16, height=10):
+        """
+        Initialize renderer with grid dimensions.
+        
+        Parameters:
+        - width: Grid width (landscape mode)
+        - height: Grid height (landscape mode)
+        """
+        self.width = width
+        self.height = height
+        self.is_rendering = False
+        
+    def start(self):
+        """Start/initialize the renderer"""
+        self.is_rendering = True
+        
+    def stop(self):
+        """Stop/cleanup the renderer"""
+        self.is_rendering = False
+        
+    def render(self, pixels):
+        """
+        Render pixel dictionary to target.
+        
+        Parameters:
+        - pixels: Dictionary with integer indices as keys, RGB tuples as values
+                  Special key "background" for background color
+        
+        Must be implemented by subclasses.
+        """
+        raise NotImplementedError("Subclasses must implement render method")
 
+
+################################################################################
+# region NeoPixelRenderer
+################################################################################
+class NeoPixelRenderer(RendererBase):
+    """Renderer for NeoPixel LED strips (MicroPython)"""
+    
+    def __init__(self, brightness=0.8, width=WIDTH, height=HEIGHT):
+        """
+        Initialize NeoPixel renderer.
+        
+        Parameters:
+        - strip: NeoPixel strip object
+        - brightness: LED brightness (0.0 to 1.0)
+        - width: Grid width
+        - height: Grid height
+        """
+        super().__init__(width, height)
+        strip = NeoPixel()
+        strip.brightness = brightness
+        self.strip = strip
+        self.strip.brightness = brightness
+        
+    def render(self, pixels):
+        """Render to NeoPixel strip"""
+        if not self.is_rendering:
+            return
+        
+        background = pixels.pop('background', DARK_BLUE)
+        self.strip.pixels_fill(background)
+        
+        for idx, color in pixels.items():
+            if isinstance(idx, str):  # Skip special keys like "background"
+                continue
+            if 0 <= idx < self.width * self.height:
+                self.strip.pixels_set(idx, color)
+        self.strip.pixels_show()
+        
+       
+################################################################################
+# region GIFRenderer
+################################################################################ 
+class GIFRenderer(RendererBase):
+    """Renderer for creating animated GIFs (Python with PIL)"""
+    
+    def __init__(self, 
+                 output_path="animation.gif", 
+                 fps=10, 
+                 smoothing=False,
+                 width=WIDTH, 
+                 height=HEIGHT, 
+                 scale=10):
+        """
+        Initialize GIF renderer.
+        
+        Parameters:
+        - output_path: Path to save GIF file
+        - fps: Frames per second
+        - smoothing: Apply morphological smoothing (rounding corners)
+        - width: Grid width
+        - height: Grid height
+        - scale: Pixel scale factor (each LED pixel = scale×scale image pixels)
+        """
+        
+        from pathlib import Path
+        output_dir = Path(output_path).parent
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if not Path(output_path).is_absolute():
+            output_path = Path(__file__).parent / output_path
+        
+        super().__init__(width, height)
+        self.output_path = output_path
+        self.fps = fps
+        self.smoothing = smoothing
+        self.scale = scale
+        self.frames = []
+        
+    def scale_color(self, color):
+        """Scale color tuple to 0-255 range"""
+        scale = 255/4
+        return tuple(min(max(int(c * scale), 0), 255) for c in color)
+        
+    def start(self):
+        """Start recording frames"""
+        super().start()
+        self.frames = []
+        
+    def render(self, pixels):
+        """Capture frame for GIF"""
+        if not self.is_rendering:
+            return
+            
+        try:
+            from PIL import Image
+        except ImportError:
+            print("PIL/Pillow required for GIF rendering")
+            return
+            
+        # Create image for this frame
+        img = Image.new('RGB', (self.width * self.scale, 
+                                self.height * self.scale))
+        img_pixels = img.load()
+        
+        # Get background
+        background = pixels.pop('background', DARK_BLUE)
+        
+        # Fill background
+        for y in range(self.height * self.scale):
+            for x in range(self.width * self.scale):
+                img_pixels[x, y] = self.scale_color(background)
+        
+        # Draw pixels
+        for idx, color in pixels.items():
+            if isinstance(idx, str):  # Skip special keys like "background"
+                continue
+            if 0 <= idx < self.width * self.height:
+                u, v = i2p(idx, width=self.height)
+                for dy in range(self.scale):
+                    for dx in range(self.scale):
+                        x = u * self.scale + dx
+                        y = v * self.scale + dy
+                        img_pixels[y, x] = self.scale_color(color)
+                        
+        # Use opencv to apply morphological smoothing (rounding corners)
+        if self.smoothing:
+            try:
+                import cv2
+                import numpy as np
+                
+                # Convert PIL image to OpenCV format
+                cv_img = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
+                
+                # Create circular kernel
+                kernel_size = self.scale // 2
+                kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, 
+                                                (kernel_size, kernel_size))
+                
+                # Apply morphological operations
+                cv_img = cv2.morphologyEx(cv_img, cv2.MORPH_OPEN, kernel, iterations=1)
+                cv_img = cv2.morphologyEx(cv_img, cv2.MORPH_CLOSE, kernel, iterations=1)
+                cv_img = cv2.morphologyEx(cv_img, cv2.MORPH_OPEN, kernel, iterations=1)
+                cv_img = cv2.morphologyEx(cv_img, cv2.MORPH_CLOSE, kernel, iterations=1)
+                
+                # Convert back to PIL format
+                img = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
+            except ImportError:
+                pass  # OpenCV not available, skip smoothing
+        
+        
+        
+        self.frames.append(img)
+    
+    def stop(self):
+        """Save GIF and cleanup"""
+        super().stop()
+        if self.frames:
+            try:
+                self.frames[0].save(
+                    self.output_path,
+                    save_all=True,
+                    append_images=self.frames[1:],
+                    duration=int(1000 / self.fps),
+                    loop=0
+                )
+                print(f"GIF saved to {self.output_path} ({len(self.frames)} frames)")
+            except Exception as e:
+                print(f"Error saving GIF: {e}")
+
+
+################################################################################
+# region Main Animation Loop
+################################################################################
 def animate_xmas_tree():
-    strip = NeoPixel()
-    strip.brightness = 1.8
+    if MICROPYTHON:
+        renderer = NeoPixelRenderer(brightness=1.8, 
+                                    width=WIDTH, 
+                                    height=HEIGHT)
+    else:
+        renderer = GIFRenderer(width=HEIGHT, 
+                               height=WIDTH, 
+                               scale=20,
+                               output_path="result.gif")
+    renderer.start()
     
     # Create animation manager
     manager = AnimationManager(frames_between_loops=20)
@@ -1295,7 +1529,7 @@ def animate_xmas_tree():
             pixels = {}
             pixels = test.update(pixels)
             render(strip, pixels)
-            time.sleep(0.1)
+            sleep(0.1)
         return
     
     # Add animations to manager with timing
@@ -1311,7 +1545,7 @@ def animate_xmas_tree():
     manager.add_animation(firework_anim, start_frame=220, duration=210)
     
     # Phase 4: New Year text
-    manager.add_animation(newyear_text_anim, start_frame=250, duration=150)
+    manager.add_animation(newyear_text_anim, start_frame=250, duration=160)
     
     # Target frame rate
     FRAME_RATE = 10  # frames per second
@@ -1320,16 +1554,21 @@ def animate_xmas_tree():
     
     # Main loop
     while True:
-        start_time = time.ticks_ms()
+        start_time = ticks_ms()
         pixels = {}
         pixels["background"] = DARK_BLUE  # Default background
         pixels = manager.update(pixels)
-        render(strip, pixels)
-        elapsed = time.ticks_ms() - start_time
+        renderer.render(pixels)
+        elapsed = ticks_ms() - start_time
         sleep_time = max(0, int(1000 / FRAME_RATE) - elapsed)
-        time.sleep(sleep_time / 1000.0)
+        sleep(sleep_time / 1000.0)
         if DEBUG:
             print("Frame:", manager.get_frame())
+            
+        if isinstance(renderer, GIFRenderer) and manager.get_repeat_count() >= 1:
+            print("Animation complete.")
+            renderer.stop()
+            break
 
 if __name__=='__main__':
     animate_xmas_tree()

@@ -20,7 +20,9 @@ This project implements a festive animation sequence for a 16×10 LED grid using
 
 
 
+**Result**
 
+![The resulting GIF](./result.gif)
 
 
 
